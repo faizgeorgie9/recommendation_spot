@@ -72,17 +72,12 @@ def initialize_system():
 def booking_slot(nama_klien, req_duration, req_spot, sellable_quota):
     daily_dur_req = req_duration * req_spot
     
-    # Validasi nama duplikat
-    if (st.session_state.df_simulasi['client'] == nama_klien).any():
-        st.error(f"❌ Klien dengan nama '{nama_klien}' sudah ada di playlist!")
-        return
-        
     # Validasi kuota
     if daily_dur_req > sellable_quota:
         st.error(f"❌ Kuota tidak cukup! Paket ini butuh {daily_dur_req} detik, sisa kuota jual hanya {sellable_quota} detik.")
         return
         
-    # Tambahkan klien ke dataframe
+    # Tambahkan klien ke dataframe (nama duplikat sekarang diizinkan)
     new_row = pd.DataFrame([{
         "client": nama_klien, 
         "duration": float(req_duration), 
@@ -107,11 +102,12 @@ def batal_booking(nama_klien):
         st.error(f"❌ Klien '{nama_klien}' tidak ditemukan di playlist!")
         return
         
+    # Ambil HANYA index pertama yang cocok, jadi kalau ada nama dobel, cuma dihapus satu
     idx = df_sim[mask].index[0]
     dur_batal = df_sim.at[idx, 'duration']
     spot_batal = df_sim.at[idx, 'commited_spot']
     
-    # Hapus baris klien dari playlist
+    # Hapus SATU baris klien tersebut dari playlist
     st.session_state.df_simulasi = df_sim.drop(idx).reset_index(drop=True)
     
     df_calc, summary_calc = calculate_metrics(st.session_state.df_simulasi)
@@ -119,8 +115,8 @@ def batal_booking(nama_klien):
     st.session_state.sheets_data[sheet_name] = (df_calc, summary_calc)
     st.session_state.sheet_counter += 1
     
-    st.session_state.logs.append(f"🗑️ Klien '{nama_klien}' dihapus. Kuota {dur_batal}s/{spot_batal}x dikembalikan.")
-    st.warning(f"Klien {nama_klien} berhasil dihapus dari sistem!")
+    st.session_state.logs.append(f"🗑️ Klien '{nama_klien}' (1 slot) dihapus. Kuota {dur_batal}s/{spot_batal}x dikembalikan.")
+    st.warning(f"Satu slot milik {nama_klien} berhasil dihapus dari sistem!")
 
 # ==========================================
 # 4. TAMPILAN GUI STREAMLIT
