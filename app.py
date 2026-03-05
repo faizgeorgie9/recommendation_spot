@@ -72,12 +72,12 @@ def initialize_system():
 def booking_slot(nama_klien, req_duration, req_spot, sellable_quota):
     daily_dur_req = req_duration * req_spot
     
-    # Validasi kuota
+    # Validasi kuota (mencegah booking jika akan merusak batas aman 10%)
     if daily_dur_req > sellable_quota:
         st.error(f"❌ Kuota tidak cukup! Paket ini butuh {daily_dur_req} detik, sisa kuota jual hanya {sellable_quota} detik.")
         return
         
-    # Tambahkan klien ke dataframe (nama duplikat sekarang diizinkan)
+    # Tambahkan klien ke dataframe (nama duplikat diizinkan)
     new_row = pd.DataFrame([{
         "client": nama_klien, 
         "duration": float(req_duration), 
@@ -142,8 +142,10 @@ else:
     total_detik_terjual = summary_calc['total_filled_operational'].iloc[0]
     sellable_quota = kapasitas_maksimal_jual - total_detik_terjual
     
-    # Pencegahan error jika kuota melebihi batas (overbooked)
-    if sellable_quota < 0: 
+    # Flag pendeteksi apakah sudah melewati threshold
+    is_over_threshold = False
+    if sellable_quota <= 0: 
+        is_over_threshold = True
         sellable_quota = 0
         
     persen_terjual = (total_detik_terjual / kapasitas_maksimal_jual) * 100
@@ -153,6 +155,11 @@ else:
     # --- TAMPILKAN METRIK DI ATAS ---
     st.markdown("---")
     st.subheader("📈 Status Kapasitas LED Saat Ini (Batas Aman 90%)")
+    
+    # NOTIFIKASI POP-UP JIKA MELEWATI THRESHOLD
+    if is_over_threshold:
+        st.toast("🚨 KAPASITAS LED PENUH! Memasuki Threshold 10%.", icon="⚠️")
+        st.error("🚨 **PERINGATAN OVERBOOKED:** Kapasitas penjualan telah habis! Anda sudah berada di batas aman *buffer* operasional (Threshold 10%).")
     
     st.progress(persen_terjual / 100)
     
