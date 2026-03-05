@@ -48,6 +48,8 @@ if 'sheet_counter' not in st.session_state:
     st.session_state.sheet_counter = 2
 if 'logs' not in st.session_state:
     st.session_state.logs = []
+if 'notif' not in st.session_state:
+    st.session_state.notif = None # Untuk menyimpan pop-up toast
 
 def initialize_system():
     data_awal = [
@@ -65,6 +67,7 @@ def initialize_system():
     
     st.session_state.sistem_siap = True
     st.session_state.logs.append("✅ Sistem diinisialisasi. Playlist awal dimuat.")
+    st.session_state.notif = {"msg": "Sistem berhasil dimuat!", "icon": "🚀"}
 
 # ==========================================
 # 3. FUNGSI BOOKING & BATAL
@@ -72,12 +75,13 @@ def initialize_system():
 def booking_slot(nama_klien, req_duration, req_spot, sellable_quota):
     daily_dur_req = req_duration * req_spot
     
-    # Validasi kuota (mencegah booking jika akan merusak batas aman 10%)
+    # LOGIKA PENOLAKAN JIKA MELEWATI BATAS 10%
     if daily_dur_req > sellable_quota:
-        st.error(f"❌ Kuota tidak cukup! Paket ini butuh {daily_dur_req} detik, sisa kuota jual hanya {sellable_quota} detik.")
-        return
+        st.toast("🚨 GAGAL: Kuota penuh atau tidak mencukupi!", icon="❌")
+        st.error(f"❌ **Gagal menambahkan '{nama_klien}'!**\n\nPaket ini membutuhkan **{daily_dur_req} detik**, sedangkan sisa kuota jual Anda hanya **{int(sellable_quota)} detik**. Anda telah menyentuh batas aman (Threshold 10%).")
+        return False # Return False agar layar tidak ter-refresh dan error bisa dibaca user
         
-    # Tambahkan klien ke dataframe (nama duplikat diizinkan)
+    # Tambahkan klien ke dataframe
     new_row = pd.DataFrame([{
         "client": nama_klien, 
         "duration": float(req_duration), 
@@ -91,8 +95,16 @@ def booking_slot(nama_klien, req_duration, req_spot, sellable_quota):
     st.session_state.sheets_data[sheet_name] = (df_calc, summary_calc)
     st.session_state.sheet_counter += 1
     
-    st.session_state.logs.append(f"📥 Klien '{nama_klien}' masuk ke playlist (Dur: {req_duration}s, Spot: {req_spot})")
-    st.success(f"Berhasil menambahkan {nama_klien} ke playlist!")
+    st.session_state.logs.append(f"📥 Klien '{nama_klien}' masuk (Dur: {req_duration}s, Spot: {req_spot})")
+    
+    # Cek apakah setelah ditambahkan kuota jadi persis 0
+    sisa_sekarang = sellable_quota - daily_dur_req
+    if sisa_sekarang <= 0:
+        st.session_state.notif = {"msg": f"✅ {nama_klien} masuk. 🚨 PERINGATAN: Kuota Sekarang PENUH (Batas 10%)!", "icon": "⚠️"}
+    else:
+        st.session_state.notif = {"msg": f"✅ Klien '{nama_klien}' berhasil ditambahkan ke Playlist!", "icon": "🎉"}
+        
+    return True # Berhasil
 
 def batal_booking(nama_klien):
     df_sim = st.session_state.df_simulasi
@@ -100,14 +112,12 @@ def batal_booking(nama_klien):
     
     if not mask.any():
         st.error(f"❌ Klien '{nama_klien}' tidak ditemukan di playlist!")
-        return
+        return False
         
-    # Ambil HANYA index pertama yang cocok, jadi kalau ada nama dobel, cuma dihapus satu
     idx = df_sim[mask].index[0]
     dur_batal = df_sim.at[idx, 'duration']
     spot_batal = df_sim.at[idx, 'commited_spot']
     
-    # Hapus SATU baris klien tersebut dari playlist
     st.session_state.df_simulasi = df_sim.drop(idx).reset_index(drop=True)
     
     df_calc, summary_calc = calculate_metrics(st.session_state.df_simulasi)
@@ -115,8 +125,9 @@ def batal_booking(nama_klien):
     st.session_state.sheets_data[sheet_name] = (df_calc, summary_calc)
     st.session_state.sheet_counter += 1
     
-    st.session_state.logs.append(f"🗑️ Klien '{nama_klien}' (1 slot) dihapus. Kuota {dur_batal}s/{spot_batal}x dikembalikan.")
-    st.warning(f"Satu slot milik {nama_klien} berhasil dihapus dari sistem!")
+    st.session_state.logs.append(f"🗑️ Klien '{nama_klien}' dihapus. Kuota {dur_batal}s/{spot_batal}x dikembalikan.")
+    st.session_state.notif = {"msg": f"🗑️ Slot milik {nama_klien} dihapus. Kuota dikembalikan.", "icon": "✅"}
+    return True
 
 # ==========================================
 # 4. TAMPILAN GUI STREAMLIT
@@ -131,6 +142,11 @@ if not st.session_state.sistem_siap:
         initialize_system()
         st.rerun()
 else:
+    # --- MUNCULKAN POP-UP NOTIF JIKA ADA ---
+    if st.session_state.notif:
+        st.toast(st.session_state.notif["msg"], icon=st.session_state.notif["icon"])
+        st.session_state.notif = None # Hapus agar tidak muncul terus
+        
     # --- HITUNG METRIK VISUAL ---
     df_sim = st.session_state.df_simulasi
     df_calc, summary_calc = calculate_metrics(df_sim)
@@ -142,10 +158,7 @@ else:
     total_detik_terjual = summary_calc['total_filled_operational'].iloc[0]
     sellable_quota = kapasitas_maksimal_jual - total_detik_terjual
     
-    # Flag pendeteksi apakah sudah melewati threshold
-    is_over_threshold = False
-    if sellable_quota <= 0: 
-        is_over_threshold = True
+    if sellable_quota < 0: 
         sellable_quota = 0
         
     persen_terjual = (total_detik_terjual / kapasitas_maksimal_jual) * 100
@@ -155,11 +168,6 @@ else:
     # --- TAMPILKAN METRIK DI ATAS ---
     st.markdown("---")
     st.subheader("📈 Status Kapasitas LED Saat Ini (Batas Aman 90%)")
-    
-    # NOTIFIKASI POP-UP JIKA MELEWATI THRESHOLD
-    if is_over_threshold:
-        st.toast("🚨 KAPASITAS LED PENUH! Memasuki Threshold 10%.", icon="⚠️")
-        st.error("🚨 **PERINGATAN OVERBOOKED:** Kapasitas penjualan telah habis! Anda sudah berada di batas aman *buffer* operasional (Threshold 10%).")
     
     st.progress(persen_terjual / 100)
     
@@ -176,7 +184,6 @@ else:
         st.subheader("📋 Rekomendasi Kapasitas per Variasi")
         st.caption("Menunjukkan berapa banyak klien tambahan yang bisa ditampung berdasarkan sisa kuota saat ini.")
         
-        # Kalkulasi Rekomendasi Dinamis
         durations = [30.0, 15.0, 7.5]
         spots = [540, 270, 135]
         
@@ -206,17 +213,23 @@ else:
             dur_baru = st.selectbox("Pilih Durasi (Detik)", [30.0, 15.0, 7.5])
             spot_baru = st.selectbox("Pilih Commited Spot", [540, 270, 135])
             btn_book = st.form_submit_button("Tambahkan ke Playlist")
+            
+            # Jika tombol diklik
             if btn_book and nama_baru:
-                booking_slot(nama_baru, dur_baru, spot_baru, sellable_quota)
-                st.rerun() 
+                sukses = booking_slot(nama_baru, dur_baru, spot_baru, sellable_quota)
+                # Hanya me-refresh halaman (rerun) JIKA booking berhasil
+                # Jika gagal, layar diam dan menampilkan error berwarna merah
+                if sukses:
+                    st.rerun() 
                 
         st.subheader("🗑️ Form Batal Booking")
         with st.form("form_batal"):
             nama_batal = st.text_input("Nama Klien yang Dihapus")
             btn_batal = st.form_submit_button("Hapus dari Playlist")
             if btn_batal and nama_batal:
-                batal_booking(nama_batal)
-                st.rerun() 
+                sukses = batal_booking(nama_batal)
+                if sukses:
+                    st.rerun() 
                 
         st.subheader("📜 Log Aktivitas")
         for log in reversed(st.session_state.logs[-5:]): 
