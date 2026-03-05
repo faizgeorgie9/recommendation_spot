@@ -38,7 +38,6 @@ def calculate_metrics(df_input):
 # ==========================================
 # 2. INISIALISASI SESSION STATE
 # ==========================================
-# st.session_state digunakan agar data tidak reset saat tombol ditekan
 if 'sistem_siap' not in st.session_state:
     st.session_state.sistem_siap = False
 
@@ -56,7 +55,6 @@ if 'logs' not in st.session_state:
 
 
 def initialize_system():
-    """Fungsi untuk setup awal tabel rekomendasi"""
     data_awal = [
         ["client a", 7.5, 540], ["client b", 15, 270],
         ["client c", 7.5, 270], ["client d", 30, 135],
@@ -65,11 +63,9 @@ def initialize_system():
     ]
     df_awal = pd.DataFrame(data_awal, columns=["client", "duration", "commited_spot"])
     
-    # Sheet 1
     df_awal_calc, summary_awal = calculate_metrics(df_awal)
     st.session_state.sheets_data["1_Kondisi_Awal"] = (df_awal_calc, summary_awal)
     
-    # Sheet 2
     total_duration_operational = 18 * 3600
     threshold_sec = 0.10 * total_duration_operational
     sellable_quota = summary_awal['remain_quota_sec'].iloc[0] - threshold_sec
@@ -165,19 +161,50 @@ st.set_page_config(page_title="LED Booking System", layout="wide")
 st.title("📺 Sistem Booking Slot Iklan LED")
 st.markdown("Simulasi *booking* dan manajemen slot kosong untuk *digital billboard*.")
 
-# --- Tombol Inisialisasi ---
 if not st.session_state.sistem_siap:
     st.info("Sistem belum berjalan. Klik tombol di bawah untuk membuat slot rekomendasi.")
     if st.button("🚀 Inisialisasi Sistem"):
         initialize_system()
         st.rerun()
 else:
-    # --- JIKA SISTEM SUDAH JALAN ---
+    # --- HITUNG METRIK VISUAL ---
+    df_sim = st.session_state.df_simulasi
+    
+    # Hitung total detik yang di-booking oleh klien asli (bukan slot kosong)
+    mask_terjual = ~df_sim['client'].str.contains(r"\[SLOT KOSONG\]")
+    total_detik_terjual = (df_sim[mask_terjual]['duration'] * df_sim[mask_terjual]['commited_spot']).sum()
+    
+    total_operasional = 18 * 3600
+    threshold = 0.10 * total_operasional
+    kapasitas_maksimal_jual = total_operasional - threshold
+    
+    persen_terjual = (total_detik_terjual / kapasitas_maksimal_jual) * 100
+    persen_sisa = 100 - persen_terjual
+    
+    # Hitung jumlah slot
+    total_slot_rekomendasi = len(df_sim[df_sim['original_slot_name'].str.contains(r"\[SLOT KOSONG\]", na=False)])
+    slot_terisi = len(df_sim[(~df_sim['client'].str.contains(r"\[SLOT KOSONG\]")) & (df_sim['original_slot_name'].str.contains(r"\[SLOT KOSONG\]", na=False))])
+    sisa_slot = total_slot_rekomendasi - slot_terisi
+
+    # --- TAMPILKAN METRIK DI ATAS ---
+    st.markdown("---")
+    st.subheader("📈 Status Kapasitas LED Saat Ini")
+    
+    # Menampilkan progress bar yang intuitif
+    st.progress(persen_terjual / 100)
+    
+    # Menampilkan angka metrik berjajar
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Kuota Slot Terjual", f"{persen_terjual:.1f}%", f"{slot_terisi} slot")
+    col_m2.metric("Sisa Kuota Tersedia", f"{persen_sisa:.1f}%", f"{sisa_slot} slot tersisa", delta_color="inverse")
+    col_m3.metric("Waktu Tersedia", f"{int((kapasitas_maksimal_jual - total_detik_terjual) / 60)} Menit", "Siap dijual")
+    st.markdown("---")
+
+    # --- TAMPILAN UTAMA ---
     col1, col2 = st.columns([2, 1])
     
     with col1:
         st.subheader("📋 Daftar Slot Kosong (Tersedia)")
-        df_sim = st.session_state.df_simulasi
         mask_kosong = df_sim['client'].str.contains(r"\[SLOT KOSONG\]")
         df_kosong = df_sim[mask_kosong]
         
@@ -200,6 +227,7 @@ else:
             btn_book = st.form_submit_button("Booking Slot!")
             if btn_book and nama_baru:
                 booking_slot(nama_baru, dur_baru, spot_baru)
+                st.rerun() # Refresh agar progress bar langsung update
                 
         st.subheader("🗑️ Form Batal Booking")
         with st.form("form_batal"):
@@ -207,13 +235,13 @@ else:
             btn_batal = st.form_submit_button("Batalkan Slot")
             if btn_batal and nama_batal:
                 batal_booking(nama_batal)
+                st.rerun() # Refresh agar progress bar langsung update
                 
         st.subheader("📜 Log Aktivitas")
-        for log in reversed(st.session_state.logs):
+        for log in reversed(st.session_state.logs[-5:]): # Tampilkan 5 log terakhir saja
             st.text(log)
             
         st.subheader("💾 Export ke Excel")
-        # Fungsi untuk merender file Excel ke dalam memory (BytesIO) agar bisa di-download via browser
         output = io.BytesIO()
         writer = pd.ExcelWriter(output, engine='xlsxwriter')
         for sheet_name, (df_main, df_summary) in st.session_state.sheets_data.items():
