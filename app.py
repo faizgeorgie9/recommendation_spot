@@ -1,255 +1,326 @@
 import streamlit as st
 import pandas as pd
+import datetime
 import io
 
 # ==========================================
-# 1. FUNGSI PERHITUNGAN UTAMA
+# 1. KONFIGURASI GLOBAL
 # ==========================================
-def calculate_metrics(df_input):
-    df = df_input.copy()
-    if 'total_duration_daily' not in df.columns:
-        df['total_duration_daily'] = df['duration'] * df['commited_spot']
+TOTAL_DETIK_HARI = 64800  # 18 Jam Operasional
+BASE_SPOT = 135
+TARGET_L_MIN = BASE_SPOT * 1.10  # 148.5 (110%)
+TARGET_L_MAX = BASE_SPOT * 1.15  # 155.25 (115%)
+
+# ==========================================
+# 2. FUNGSI PERHITUNGAN UTAMA & SEQUENCE
+# ==========================================
+def calculate_metrics_daily(df_daily):
+    """Menghitung metrik khusus untuk 1 Layar di 1 Hari tertentu"""
+    df = df_daily.copy()
+    
+    # ----------------------------------------------------
+    # -----
+    # FIX: Pastikan kolom 'loop' selalu ada meskipun data kosong
+    if 'loop' not in df.columns:
+        df['loop'] = pd.Series(dtype='float64')
+    # ---------------------------------------------------------
+    
+    if len(df) == 0:
+        return df, pd.DataFrame([{
+            'total_duration_sec': 0, 'total_spot': 0, 'total_cycle_duration': 0,
+            'jumlah_loop_perhari': 0, 'target_l_min': TARGET_L_MIN, 'target_l_max': TARGET_L_MAX, 'status_l_tercapai': False
+        }])
         
     total_duration_sum = df['duration'].sum()
-    total_spot_sum = df['commited_spot'].sum()
-    total_filled_operational = df['total_duration_daily'].sum()
-    total_duration_operational = 18 * 3600  # 64,800 detik
+    total_spot_sum = df['total_spot'].sum()
+    
+    # Hitung Loop
+    df['loop'] = df['total_spot'] / BASE_SPOT
+    total_cycle_duration = (df['duration'] * df['loop']).sum()
+    jumlah_loop_perhari = TOTAL_DETIK_HARI / total_cycle_duration if total_cycle_duration > 0 else 0
     
     summary_data = {
         'total_duration_sec': total_duration_sum,
         'total_spot': total_spot_sum,
-        'total_filled_operational': total_filled_operational,
-        'total_duration_operational': total_duration_operational,
-        'remain_quota_sec': total_duration_operational - total_filled_operational,
-        'total_loop_capacity': total_duration_operational / total_duration_sum if total_duration_sum > 0 else 0
+        'total_cycle_duration': total_cycle_duration,
+        'jumlah_loop_perhari': jumlah_loop_perhari,
+        'target_l_min': TARGET_L_MIN,
+        'target_l_max': TARGET_L_MAX,
+        'status_l_tercapai': TARGET_L_MIN <= jumlah_loop_perhari <= TARGET_L_MAX
     }
-    summary_df = pd.DataFrame([summary_data])
-    summary_df['percent_remain_quota'] = (summary_df['remain_quota_sec'] / summary_df['total_duration_operational']) * 100
     
-    if total_duration_sum > 0:
-        df['n1'] = df['commited_spot'] / summary_df['total_loop_capacity'].iloc[0]
-        df['n2'] = df['n1'] / df['n1'].iloc[0]
-        df['loop'] = df['n2'] * 4
-        df['loop'] = df['loop'].round().astype(int) 
-        df['total_loop_duration'] = df['duration'] * df['loop']
+    return df, pd.DataFrame([summary_data])
+
+def generate_playlist_sequence(df):
+    sequence_data = []
+    if len(df) == 0:
+        return pd.DataFrame(columns=['Urutan', 'Date', 'Screen', 'File Name', 'Duration', 'Spot'])
+        
+    max_loop = int(df['loop'].round().max())
+    urutan = 1
     
-    return df, summary_df
+    for putaran in range(1, max_loop + 1):
+        for index, row in df.iterrows():
+            if round(row['loop']) >= putaran:
+                sequence_data.append({
+                    'Urutan': urutan,
+                    'Date': row['date'],
+                    'Screen': row['screen_name'],
+                    'File Name': row['file_name'],
+                    'Duration': row['duration'],
+                    'Spot': row['total_spot']
+                })
+                urutan += 1
+    return pd.DataFrame(sequence_data)
+
+def hitung_rekomendasi(df_current):
+    if len(df_current) == 0:
+        C_current = 0
+    else:
+        C_current = (df_current['duration'] * (df_current['total_spot'] / BASE_SPOT)).sum()
+        
+    C_target_mid = TOTAL_DETIK_HARI / ((TARGET_L_MIN + TARGET_L_MAX) / 2)
+    
+    durations = [30.0, 15.0, 7.5]
+    spots = [540, 270, 135]
+    rekomendasi_data = []
+    
+    for d in durations:
+        for s in spots:
+            unit_dur_cycle = d * (s / BASE_SPOT)
+            k_ideal = (C_target_mid - C_current) / unit_dur_cycle if unit_dur_cycle > 0 else 0
+            k = max(0, round(k_ideal))
+            
+            if k > 0:
+                L_estimasi = TOTAL_DETIK_HARI / (C_current + (k * unit_dur_cycle))
+                status = "✅ Pas Target" if TARGET_L_MIN <= L_estimasi <= TARGET_L_MAX else "⚠️ Mendekati"
+                rekomendasi_data.append({
+                    "Durasi Paket": f"{d}s", "Commited Spot": f"{s}x",
+                    "Max Klien Ditambahkan": k, "Estimasi Loop/Hari": f"{L_estimasi:.2f}", "Status": status
+                })
+            else:
+                rekomendasi_data.append({
+                    "Durasi Paket": f"{d}s", "Commited Spot": f"{s}x",
+                    "Max Klien Ditambahkan": 0, "Estimasi Loop/Hari": "-", "Status": "❌ Penuh"
+                })
+    return pd.DataFrame(rekomendasi_data)
 
 # ==========================================
-# 2. INISIALISASI SESSION STATE
+# 3. INISIALISASI SESSION STATE
 # ==========================================
-if 'sistem_siap' not in st.session_state:
-    st.session_state.sistem_siap = False
-if 'sheets_data' not in st.session_state:
-    st.session_state.sheets_data = {}
-if 'df_simulasi' not in st.session_state:
-    st.session_state.df_simulasi = None
-if 'sheet_counter' not in st.session_state:
-    st.session_state.sheet_counter = 2
-if 'logs' not in st.session_state:
-    st.session_state.logs = []
-if 'notif' not in st.session_state:
-    st.session_state.notif = None # Untuk menyimpan pop-up toast
+if 'sistem_siap' not in st.session_state: st.session_state.sistem_siap = False
+if 'df_master' not in st.session_state: st.session_state.df_master = pd.DataFrame()
+if 'logs' not in st.session_state: st.session_state.logs = []
+if 'notif' not in st.session_state: st.session_state.notif = None 
 
 def initialize_system():
-    data_awal = [
-        ["client a", 7.5, 540], ["client b", 15, 270],
-        ["client c", 7.5, 270], ["client d", 30, 135],
-        ["client e", 7.5, 135], ["client f", 15, 135],
-        ["client g", 7.5, 270], ["client test", 30, 540]
-    ]
-    df_awal = pd.DataFrame(data_awal, columns=["client", "duration", "commited_spot"])
+    tgl_hari_ini = datetime.date.today()
+    # Dummy data awal (anggap booking selama 3 hari ke depan untuk contoh)
+    data_awal = []
+    screens = ["LED Sudirman", "LED Thamrin"]
     
-    df_awal_calc, summary_awal = calculate_metrics(df_awal)
-    
-    st.session_state.sheets_data["1_Kondisi_Awal"] = (df_awal_calc, summary_awal)
-    st.session_state.df_simulasi = df_awal.copy()
-    
+    for i in range(3):
+        tgl = tgl_hari_ini + datetime.timedelta(days=i)
+        for screen in screens:
+            data_awal.extend([
+                [screen, "indofood_15s.mp4", tgl, 15, 270, 15*270],
+                [screen, "telkomsel_30s.mp4", tgl, 30, 135, 30*135],
+                [screen, "gojek_7_5s.mp4", tgl, 7.5, 540, 7.5*540]
+            ])
+            
+    st.session_state.df_master = pd.DataFrame(data_awal, columns=['screen_name', 'file_name', 'date', 'duration', 'total_spot', 'total_duration'])
     st.session_state.sistem_siap = True
-    st.session_state.logs.append("✅ Sistem diinisialisasi. Playlist awal dimuat.")
-    st.session_state.notif = {"msg": "Sistem berhasil dimuat!", "icon": "🚀"}
+    st.session_state.logs.append("✅ Sistem diinisialisasi dengan struktur data baru.")
 
 # ==========================================
-# 3. FUNGSI BOOKING & BATAL
+# 4. FUNGSI BOOKING RANGE TANGGAL
 # ==========================================
-def booking_slot(nama_klien, req_duration, req_spot, sellable_quota):
-    daily_dur_req = req_duration * req_spot
-    
-    # LOGIKA PENOLAKAN JIKA MELEWATI BATAS 10%
-    if daily_dur_req > sellable_quota:
-        st.toast("🚨 GAGAL: Kuota penuh atau tidak mencukupi!", icon="❌")
-        st.error(f"❌ **Gagal menambahkan '{nama_klien}'!**\n\nPaket ini membutuhkan **{daily_dur_req} detik**, sedangkan sisa kuota jual Anda hanya **{int(sellable_quota)} detik**. Anda telah menyentuh batas aman (Threshold 10%).")
-        return False # Return False agar layar tidak ter-refresh dan error bisa dibaca user
-        
-    # Tambahkan klien ke dataframe
-    new_row = pd.DataFrame([{
-        "client": nama_klien, 
-        "duration": float(req_duration), 
-        "commited_spot": int(req_spot)
-    }])
-    st.session_state.df_simulasi = pd.concat([st.session_state.df_simulasi, new_row], ignore_index=True)
-    
-    # Hitung metrik baru dan simpan history
-    df_calc, summary_calc = calculate_metrics(st.session_state.df_simulasi)
-    sheet_name = f"{st.session_state.sheet_counter}_Book_{nama_klien[:10]}"
-    st.session_state.sheets_data[sheet_name] = (df_calc, summary_calc)
-    st.session_state.sheet_counter += 1
-    
-    st.session_state.logs.append(f"📥 Klien '{nama_klien}' masuk (Dur: {req_duration}s, Spot: {req_spot})")
-    
-    # Cek apakah setelah ditambahkan kuota jadi persis 0
-    sisa_sekarang = sellable_quota - daily_dur_req
-    if sisa_sekarang <= 0:
-        st.session_state.notif = {"msg": f"✅ {nama_klien} masuk. 🚨 PERINGATAN: Kuota Sekarang PENUH (Batas 10%)!", "icon": "⚠️"}
-    else:
-        st.session_state.notif = {"msg": f"✅ Klien '{nama_klien}' berhasil ditambahkan ke Playlist!", "icon": "🎉"}
-        
-    return True # Berhasil
-
-def batal_booking(nama_klien):
-    df_sim = st.session_state.df_simulasi
-    mask = df_sim['client'] == nama_klien
-    
-    if not mask.any():
-        st.error(f"❌ Klien '{nama_klien}' tidak ditemukan di playlist!")
+def booking_slot(screen, file_name, start_date, end_date, req_duration, req_spot, qty):
+    if start_date > end_date:
+        st.error("❌ Start Date tidak boleh lebih besar dari End Date.")
         return False
-        
-    idx = df_sim[mask].index[0]
-    dur_batal = df_sim.at[idx, 'duration']
-    spot_batal = df_sim.at[idx, 'commited_spot']
+
+    date_range = pd.date_range(start_date, end_date).date
     
-    st.session_state.df_simulasi = df_sim.drop(idx).reset_index(drop=True)
-    
-    df_calc, summary_calc = calculate_metrics(st.session_state.df_simulasi)
-    sheet_name = f"{st.session_state.sheet_counter}_Cancel_{nama_klien[:10]}"
-    st.session_state.sheets_data[sheet_name] = (df_calc, summary_calc)
-    st.session_state.sheet_counter += 1
-    
-    st.session_state.logs.append(f"🗑️ Klien '{nama_klien}' dihapus. Kuota {dur_batal}s/{spot_batal}x dikembalikan.")
-    st.session_state.notif = {"msg": f"🗑️ Slot milik {nama_klien} dihapus. Kuota dikembalikan.", "icon": "✅"}
+    new_rows = []
+    for d in date_range:
+        for _ in range(qty):
+            new_rows.append({
+                "screen_name": screen,
+                "file_name": file_name,
+                "date": d,
+                "duration": float(req_duration),
+                "total_spot": int(req_spot),
+                "total_duration": float(req_duration) * int(req_spot)
+            })
+            
+    st.session_state.df_master = pd.concat([st.session_state.df_master, pd.DataFrame(new_rows)], ignore_index=True)
+    st.session_state.logs.append(f"📥 '{file_name}' ({qty} Paket) dijadwalkan di {screen} dari {start_date} s/d {end_date}.")
+    st.session_state.notif = {"msg": f"✅ Penjadwalan berhasil disimpan!", "icon": "🎉"}
     return True
 
+def batal_booking(screen, date_batal, file_name):
+    df_m = st.session_state.df_master
+    # Hapus hanya 1 row yang match dengan Screen, Date, dan File Name
+    mask = (df_m['screen_name'] == screen) & (df_m['date'] == date_batal) & (df_m['file_name'] == file_name)
+    
+    if mask.any():
+        idx = df_m[mask].index[0]
+        st.session_state.df_master = df_m.drop(idx).reset_index(drop=True)
+        st.session_state.logs.append(f"🗑️ '{file_name}' dibatalkan untuk layar {screen} pada {date_batal}.")
+        return True
+    return False
+
 # ==========================================
-# 4. TAMPILAN GUI STREAMLIT
+# 5. TAMPILAN GUI STREAMLIT
 # ==========================================
-st.set_page_config(page_title="LED Booking System", layout="wide")
-st.title("📺 Sistem Booking Slot Iklan LED")
-st.markdown("Simulasi *booking* dan rekomendasi kapasitas operasional secara *real-time*.")
+st.set_page_config(page_title="LED Booking & Audit System", layout="wide")
+st.title("📺 Sistem Manajemen & Rekonsiliasi LED")
 
 if not st.session_state.sistem_siap:
-    st.info("Sistem belum berjalan. Klik tombol di bawah untuk memuat data awal.")
-    if st.button("🚀 Inisialisasi Sistem"):
+    st.info("Sistem belum memuat database. Klik tombol di bawah untuk memulai.")
+    if st.button("🚀 Load Database LED"):
         initialize_system()
         st.rerun()
 else:
-    # --- MUNCULKAN POP-UP NOTIF JIKA ADA ---
     if st.session_state.notif:
         st.toast(st.session_state.notif["msg"], icon=st.session_state.notif["icon"])
-        st.session_state.notif = None # Hapus agar tidak muncul terus
-        
-    # --- HITUNG METRIK VISUAL ---
-    df_sim = st.session_state.df_simulasi
-    df_calc, summary_calc = calculate_metrics(df_sim)
-    
-    total_operasional = 18 * 3600
-    threshold = 0.10 * total_operasional
-    kapasitas_maksimal_jual = total_operasional - threshold
-    
-    total_detik_terjual = summary_calc['total_filled_operational'].iloc[0]
-    sellable_quota = kapasitas_maksimal_jual - total_detik_terjual
-    
-    if sellable_quota < 0: 
-        sellable_quota = 0
-        
-    persen_terjual = (total_detik_terjual / kapasitas_maksimal_jual) * 100
-    if persen_terjual > 100: persen_terjual = 100
-    persen_sisa = 100 - persen_terjual
+        st.session_state.notif = None 
 
-    # --- TAMPILKAN METRIK DI ATAS ---
-    st.markdown("---")
-    st.subheader("📈 Status Kapasitas LED Saat Ini (Batas Aman 90%)")
+    # --- PENGATURAN MULTI-TAB ---
+    tab1, tab2 = st.tabs(["📅 Perencanaan & Jadwal Tayang", "⚖️ Audit (Compare Daily Summary)"])
     
-    st.progress(persen_terjual / 100)
-    
-    col_m1, col_m2, col_m3 = st.columns(3)
-    col_m1.metric("Kuota Durasi Terpakai", f"{persen_terjual:.1f}%", f"{int(total_detik_terjual)} detik")
-    col_m2.metric("Sisa Kuota Bisa Dijual", f"{persen_sisa:.1f}%", f"{int(sellable_quota)} detik", delta_color="inverse")
-    col_m3.metric("Estimasi Waktu Jual", f"{int(sellable_quota / 60)} Menit", "Siap ditawarkan")
-    st.markdown("---")
+    # =========================================================
+    # TAB 1 : BOOKING & MANAJEMEN PLAYLIST
+    # =========================================================
+    with tab1:
+        st.markdown("### Filter Tampilan Saat Ini")
+        c_f1, c_f2 = st.columns(2)
+        
+        # Ambil daftar unik dari layar yang ada
+        layar_list = st.session_state.df_master['screen_name'].unique().tolist()
+        if not layar_list: layar_list = ["LED Sudirman", "LED Thamrin"]
+        
+        selected_screen = c_f1.selectbox("Pilih Layar LED:", layar_list)
+        selected_date = c_f2.date_input("Lihat Data Pada Tanggal:", datetime.date.today())
+        
+        st.markdown("---")
+        
+        # Ekstrak data khusus layar dan tanggal yang dipilih
+        df_view = st.session_state.df_master[(st.session_state.df_master['screen_name'] == selected_screen) & (st.session_state.df_master['date'] == selected_date)]
+        
+        df_calc, summary_calc = calculate_metrics_daily(df_view)
+        L_saat_ini = summary_calc['jumlah_loop_perhari'].iloc[0]
+        status_target = summary_calc['status_l_tercapai'].iloc[0]
 
-    # --- TAMPILAN UTAMA ---
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.subheader("📋 Rekomendasi Kapasitas per Variasi")
-        st.caption("Menunjukkan berapa banyak klien tambahan yang bisa ditampung berdasarkan sisa kuota saat ini.")
-        
-        durations = [30.0, 15.0, 7.5]
-        spots = [540, 270, 135]
-        
-        rekomendasi_data = []
-        for d in durations:
-            for s in spots:
-                kebutuhan_detik = d * s
-                max_klien = int(sellable_quota // kebutuhan_detik) if sellable_quota > 0 else 0
-                rekomendasi_data.append({
-                    "Durasi Paket": f"{d} Detik",
-                    "Commited Spot": f"{s} Kali",
-                    "Total Waktu/Hari": f"{kebutuhan_detik} Detik",
-                    "Kapasitas Maksimal": f"{max_klien} Klien"
-                })
+        # METRIK MONITORING
+        col_m1, col_m2, col_m3 = st.columns(3)
+        if status_target:
+            L_color, status_teks = "normal", "✅ TARGET TERCAPAI"
+        elif L_saat_ini > TARGET_L_MAX:
+            L_color, status_teks = "normal", "⚠️ Kekurangan Klien (Terlalu Cepat)"
+        else:
+            L_color, status_teks = "inverse", "🚨 Kelebihan Beban (Terlalu Lambat)"
+            if L_saat_ini == 0: status_teks = "⚪ Kosong"
+            
+        col_m1.metric(f"Putaran (L) - {selected_screen}", f"{L_saat_ini:.2f} Kali", status_teks, delta_color=L_color)
+        col_m2.metric("Target Ideal (110% - 115%)", f"{TARGET_L_MIN:.2f} - {TARGET_L_MAX:.2f} Kali")
+        col_m3.metric("Total Commited Spot", f"{summary_calc['total_spot'].iloc[0]} Spot")
+
+        # KONTEN UTAMA
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.subheader(f"📋 Rekomendasi Penambahan per {selected_date}")
+            df_rekomendasi = hitung_rekomendasi(df_calc)
+            st.dataframe(df_rekomendasi, use_container_width=True)
                 
-        df_rekomendasi = pd.DataFrame(rekomendasi_data)
-        st.dataframe(df_rekomendasi, use_container_width=True)
+            st.subheader(f"📊 Daftar Putar (Showing Commitment)")
+            df_edit = df_calc[['file_name', 'duration', 'total_spot', 'loop']].copy()
+            df_edit.insert(0, "Hapus", False)
             
-        st.subheader("📊 Tabel Playlist Saat Ini")
-        st.caption("Daftar klien yang aktif tayang di layar LED.")
-        st.dataframe(df_calc, use_container_width=True)
-        
-    with col2:
-        st.subheader("📝 Form Booking Klien")
-        with st.form("form_booking"):
-            nama_baru = st.text_input("Nama Klien Baru")
-            dur_baru = st.selectbox("Pilih Durasi (Detik)", [30.0, 15.0, 7.5])
-            spot_baru = st.selectbox("Pilih Commited Spot", [540, 270, 135])
-            btn_book = st.form_submit_button("Tambahkan ke Playlist")
+            edited_df = st.data_editor(
+                df_edit,
+                column_config={"Hapus": st.column_config.CheckboxColumn("Batal", default=False)},
+                disabled=list(df_edit.columns)[1:], 
+                hide_index=True, use_container_width=True
+            )
             
-            # Jika tombol diklik
-            if btn_book and nama_baru:
-                sukses = booking_slot(nama_baru, dur_baru, spot_baru, sellable_quota)
-                # Hanya me-refresh halaman (rerun) JIKA booking berhasil
-                # Jika gagal, layar diam dan menampilkan error berwarna merah
-                if sukses:
-                    st.rerun() 
+            if st.button("🗑️ Eksekusi Hapus yang Dicentang", type="primary"):
+                batal_list = edited_df[edited_df["Hapus"] == True]["file_name"].tolist()
+                for fn in batal_list:
+                    batal_booking(selected_screen, selected_date, fn)
+                st.rerun() 
                 
-        st.subheader("🗑️ Form Batal Booking")
-        with st.form("form_batal"):
-            nama_batal = st.text_input("Nama Klien yang Dihapus")
-            btn_batal = st.form_submit_button("Hapus dari Playlist")
-            if btn_batal and nama_batal:
-                sukses = batal_booking(nama_batal)
-                if sukses:
-                    st.rerun() 
+            st.subheader("📅 Preview Urutan Tayang (Playlog Sequence)")
+            df_sequence = generate_playlist_sequence(df_calc)
+            st.dataframe(df_sequence.set_index('Urutan'), use_container_width=True)
+            
+        with col2:
+            st.subheader("📝 Tambah Jadwal Tayang Baru")
+            with st.form("form_booking"):
+                f_screen = st.selectbox("Layar Target", layar_list)
+                f_file = st.text_input("File Name (.mp4)", placeholder="iklan_baru.mp4")
                 
-        st.subheader("📜 Log Aktivitas")
-        for log in reversed(st.session_state.logs[-5:]): 
-            st.text(log)
-            
-        st.subheader("💾 Export ke Excel")
-        output = io.BytesIO()
-        writer = pd.ExcelWriter(output, engine='xlsxwriter')
-        for sheet_name, (df_main, df_summary) in st.session_state.sheets_data.items():
-            df_main.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
-            
-            start_row_summary = len(df_main) + 2
-            worksheet = writer.sheets[sheet_name]
-            worksheet.write_string(start_row_summary, 0, '--- SUMMARY METRICS ---')
-            df_summary.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row_summary + 1)
-        writer.close()
+                c_d1, c_d2 = st.columns(2)
+                f_start = c_d1.date_input("Mulai Tanggal", selected_date)
+                f_end = c_d2.date_input("Sampai Tanggal", selected_date)
+                
+                c_s1, c_s2, c_s3 = st.columns(3)
+                f_qty = c_s1.number_input("Jml Paket", min_value=1, value=1)
+                f_dur = c_s2.selectbox("Durasi (s)", [30.0, 15.0, 7.5])
+                f_spot = c_s3.selectbox("Spot/Hari", [540, 270, 135])
+                
+                if st.form_submit_button("Booking ke Sistem", use_container_width=True):
+                    if f_file:
+                        if booking_slot(f_screen, f_file, f_start, f_end, f_dur, f_spot, f_qty):
+                            st.rerun()
+                    else:
+                        st.error("Nama file tidak boleh kosong!")
+
+    # =========================================================
+    # TAB 2 : REKONSILIASI (COMPARE GAP)
+    # =========================================================
+    with tab2:
+        st.markdown("### ⚖️ Audit: Showing Commitment vs Daily Summary")
+        st.info("Simulasi perbandingan data target komitmen harian yang ada di database kita dengan laporan aktual dari mesin LED.")
         
-        st.download_button(
-            label="Download Laporan Excel",
-            data=output.getvalue(),
-            file_name="Riwayat_Booking_LED.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # Buat dummy data Daily Summary (Seolah-olah diupload dari CSV)
+        if st.button("🔄 Simulasikan Tarik Laporan Aktual Mesin (Contoh)"):
+            # Kita buat data aktual yang memiliki selisih spot
+            df_aktual = st.session_state.df_master.copy()
+            # Kurangi spot beberapa baris secara acak sebagai contoh selisih
+            import numpy as np
+            np.random.seed(42)
+            # Kurangi 5-20 spot secara acak
+            df_aktual['actual_spot'] = df_aktual['total_spot'] - np.random.randint(0, 15, size=len(df_aktual)) 
+            df_aktual['actual_duration'] = df_aktual['actual_spot'] * df_aktual['duration']
+            
+            # Gabungkan dengan data planned (Showing Commitment)
+            df_planned = st.session_state.df_master.copy()
+            df_planned = df_planned.rename(columns={'total_spot': 'planned_spot', 'total_duration': 'planned_duration'})
+            
+            # Lakukan Merge (Audit)
+            df_audit = pd.merge(df_planned, df_aktual[['screen_name', 'file_name', 'date', 'actual_spot', 'actual_duration']], 
+                                on=['screen_name', 'file_name', 'date'], how='left')
+            
+            # Hitung Gap
+            df_audit['Diff Spot'] = df_audit['actual_spot'] - df_audit['planned_spot']
+            df_audit['Diff Duration'] = df_audit['actual_duration'] - df_audit['planned_duration']
+            
+            # Status
+            df_audit['Status'] = df_audit['Diff Spot'].apply(lambda x: "✅ Tercapai" if x >= 0 else "⚠️ Kurang Tayang")
+            
+            st.session_state.df_audit_result = df_audit
+            st.success("Laporan Aktual berhasil disimulasikan dan digabungkan!")
+
+        if 'df_audit_result' in st.session_state:
+            st.markdown("#### Tabel Selisih (Gap Analysis)")
+            st.dataframe(st.session_state.df_audit_result, use_container_width=True)
+            
+            # Buat Export Audit
+            output_audit = io.BytesIO()
+            with pd.ExcelWriter(output_audit, engine='xlsxwriter') as writer_audit:
+                st.session_state.df_audit_result.to_excel(writer_audit, sheet_name='Audit_Gap_Report', index=False)
+                
+            st.download_button("📥 Download Laporan Audit (Excel)", data=output_audit.getvalue(), 
+                               file_name="Laporan_Gap_LED.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
