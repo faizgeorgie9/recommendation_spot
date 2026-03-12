@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import datetime
 import io
-import urllib.parse
-from sqlalchemy import create_engine
 
 # ==========================================
 # 1. KONFIGURASI GLOBAL
@@ -17,11 +15,14 @@ TARGET_L_MAX = BASE_SPOT * 1.15  # 155.25 (115%)
 # 2. FUNGSI PERHITUNGAN UTAMA & SEQUENCE
 # ==========================================
 def calculate_metrics_daily(df_daily):
+    """Menghitung metrik khusus untuk 1 Layar di 1 Hari tertentu"""
     df = df_daily.copy()
     
+    # ---------------------------------------------------------
     # FIX: Pastikan kolom 'loop' selalu ada meskipun data kosong
     if 'loop' not in df.columns:
         df['loop'] = pd.Series(dtype='float64')
+    # ---------------------------------------------------------
     
     if len(df) == 0:
         return df, pd.DataFrame([{
@@ -32,6 +33,7 @@ def calculate_metrics_daily(df_daily):
     total_duration_sum = df['duration'].sum()
     total_spot_sum = df['total_spot'].sum()
     
+    # Hitung Loop
     df['loop'] = df['total_spot'] / BASE_SPOT
     total_cycle_duration = (df['duration'] * df['loop']).sum()
     jumlah_loop_perhari = TOTAL_DETIK_HARI / total_cycle_duration if total_cycle_duration > 0 else 0
@@ -103,28 +105,7 @@ def hitung_rekomendasi(df_current):
     return pd.DataFrame(rekomendasi_data)
 
 # ==========================================
-# 3. FUNGSI EXPORT KE SQL SERVER
-# ==========================================
-def export_to_sql_server(df):
-    """Mengekspor dataframe ke database SQL Server menggunakan SQLAlchemy"""
-    try:
-        server = r'PSWWM2604\SQLEXPRESS'
-        database = 'commited_spot'
-        driver = 'ODBC Driver 17 for SQL Server'
-        
-        connection_string = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};Trusted_Connection=yes;"
-        connection_url = f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(connection_string)}"
-        engine = create_engine(connection_url)
-        
-        # Simpan tabel ke dalam SQL dengan nama 'tb_showing_commitment'
-        # if_exists='replace' akan menimpa tabel lama jika sudah ada. (Ubah ke 'append' jika ingin menambah baris)
-        df.to_sql('tb_showing_commitment', con=engine, if_exists='replace', index=False)
-        return True, "Data berhasil di-push ke SQL Server!"
-    except Exception as e:
-        return False, f"Gagal mengekspor data: {str(e)}"
-
-# ==========================================
-# 4. INISIALISASI SESSION STATE
+# 3. INISIALISASI SESSION STATE
 # ==========================================
 if 'sistem_siap' not in st.session_state: st.session_state.sistem_siap = False
 if 'df_master' not in st.session_state: st.session_state.df_master = pd.DataFrame()
@@ -133,6 +114,7 @@ if 'notif' not in st.session_state: st.session_state.notif = None
 
 def initialize_system():
     tgl_hari_ini = datetime.date.today()
+    # Dummy data awal (anggap booking selama 3 hari ke depan untuk contoh)
     data_awal = []
     screens = ["LED Sudirman", "LED Thamrin"]
     
@@ -150,7 +132,7 @@ def initialize_system():
     st.session_state.logs.append("✅ Sistem diinisialisasi dengan struktur data baru.")
 
 # ==========================================
-# 5. FUNGSI BOOKING RANGE TANGGAL
+# 4. FUNGSI BOOKING RANGE TANGGAL
 # ==========================================
 def booking_slot(screen, file_name, start_date, end_date, req_duration, req_spot, qty):
     if start_date > end_date:
@@ -178,6 +160,7 @@ def booking_slot(screen, file_name, start_date, end_date, req_duration, req_spot
 
 def batal_booking(screen, date_batal, file_name):
     df_m = st.session_state.df_master
+    # Hapus hanya 1 row yang match dengan Screen, Date, dan File Name
     mask = (df_m['screen_name'] == screen) & (df_m['date'] == date_batal) & (df_m['file_name'] == file_name)
     
     if mask.any():
@@ -188,7 +171,7 @@ def batal_booking(screen, date_batal, file_name):
     return False
 
 # ==========================================
-# 6. TAMPILAN GUI STREAMLIT
+# 5. TAMPILAN GUI STREAMLIT
 # ==========================================
 st.set_page_config(page_title="LED Booking & Audit System", layout="wide")
 st.title("📺 Sistem Manajemen & Rekonsiliasi LED")
@@ -213,6 +196,7 @@ else:
         st.markdown("### Filter Tampilan Saat Ini")
         c_f1, c_f2 = st.columns(2)
         
+        # Ambil daftar unik dari layar yang ada
         layar_list = st.session_state.df_master['screen_name'].unique().tolist()
         if not layar_list: layar_list = ["LED Sudirman", "LED Thamrin"]
         
@@ -221,6 +205,7 @@ else:
         
         st.markdown("---")
         
+        # Ekstrak data khusus layar dan tanggal yang dipilih
         df_view = st.session_state.df_master[(st.session_state.df_master['screen_name'] == selected_screen) & (st.session_state.df_master['date'] == selected_date)]
         
         df_calc, summary_calc = calculate_metrics_daily(df_view)
@@ -291,22 +276,6 @@ else:
                     else:
                         st.error("Nama file tidak boleh kosong!")
 
-            # -----------------------------------------------------
-            # TOMBOL EXPORT KE SQL SERVER
-            # -----------------------------------------------------
-            st.markdown("---")
-            st.subheader("🗄️ Sinkronisasi Database")
-            st.caption("Push seluruh data Master Commited Spot ke SQL Server.")
-            
-            if st.button("🚀 Push ke SQL Server", type="primary", use_container_width=True):
-                with st.spinner("Menghubungkan ke SQL Server..."):
-                    success, msg = export_to_sql_server(st.session_state.df_master)
-                    if success:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-            # -----------------------------------------------------
-
     # =========================================================
     # TAB 2 : REKONSILIASI (COMPARE GAP)
     # =========================================================
@@ -314,22 +283,30 @@ else:
         st.markdown("### ⚖️ Audit: Showing Commitment vs Daily Summary")
         st.info("Simulasi perbandingan data target komitmen harian yang ada di database kita dengan laporan aktual dari mesin LED.")
         
+        # Buat dummy data Daily Summary (Seolah-olah diupload dari CSV)
         if st.button("🔄 Simulasikan Tarik Laporan Aktual Mesin (Contoh)"):
+            # Kita buat data aktual yang memiliki selisih spot
             df_aktual = st.session_state.df_master.copy()
+            # Kurangi spot beberapa baris secara acak sebagai contoh selisih
             import numpy as np
             np.random.seed(42)
+            # Kurangi 5-20 spot secara acak
             df_aktual['actual_spot'] = df_aktual['total_spot'] - np.random.randint(0, 15, size=len(df_aktual)) 
             df_aktual['actual_duration'] = df_aktual['actual_spot'] * df_aktual['duration']
             
+            # Gabungkan dengan data planned (Showing Commitment)
             df_planned = st.session_state.df_master.copy()
             df_planned = df_planned.rename(columns={'total_spot': 'planned_spot', 'total_duration': 'planned_duration'})
             
+            # Lakukan Merge (Audit)
             df_audit = pd.merge(df_planned, df_aktual[['screen_name', 'file_name', 'date', 'actual_spot', 'actual_duration']], 
                                 on=['screen_name', 'file_name', 'date'], how='left')
             
+            # Hitung Gap
             df_audit['Diff Spot'] = df_audit['actual_spot'] - df_audit['planned_spot']
             df_audit['Diff Duration'] = df_audit['actual_duration'] - df_audit['planned_duration']
             
+            # Status
             df_audit['Status'] = df_audit['Diff Spot'].apply(lambda x: "✅ Tercapai" if x >= 0 else "⚠️ Kurang Tayang")
             
             st.session_state.df_audit_result = df_audit
@@ -339,6 +316,7 @@ else:
             st.markdown("#### Tabel Selisih (Gap Analysis)")
             st.dataframe(st.session_state.df_audit_result, use_container_width=True)
             
+            # Buat Export Audit
             output_audit = io.BytesIO()
             with pd.ExcelWriter(output_audit, engine='xlsxwriter') as writer_audit:
                 st.session_state.df_audit_result.to_excel(writer_audit, sheet_name='Audit_Gap_Report', index=False)
